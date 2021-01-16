@@ -52,6 +52,10 @@
 #endif
 #endif
 
+#if defined(__GNUC__) && __GNUC__ >= 7
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#endif
 unsigned int
 lzf_decompress (const void *const in_data,  unsigned int in_len,
                 void             *out_data, unsigned int out_len)
@@ -61,9 +65,10 @@ lzf_decompress (const void *const in_data,  unsigned int in_len,
   u8 const *const in_end  = ip + in_len;
   u8       *const out_end = op + out_len;
 
-  do
+  while (ip < in_end)
     {
-      unsigned int ctrl = *ip++;
+      unsigned int ctrl;
+      ctrl = *ip++;
 
       if (ctrl < (1 << 5)) /* literal run */
         {
@@ -86,8 +91,6 @@ lzf_decompress (const void *const in_data,  unsigned int in_len,
 #ifdef lzf_movsb
           lzf_movsb (op, ip, ctrl);
 #else
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
           switch (ctrl)
             {
               case 32: *op++ = *ip++; case 31: *op++ = *ip++; case 30: *op++ = *ip++; case 29: *op++ = *ip++;
@@ -99,7 +102,6 @@ lzf_decompress (const void *const in_data,  unsigned int in_len,
               case  8: *op++ = *ip++; case  7: *op++ = *ip++; case  6: *op++ = *ip++; case  5: *op++ = *ip++;
               case  4: *op++ = *ip++; case  3: *op++ = *ip++; case  2: *op++ = *ip++; case  1: *op++ = *ip++;
             }
-#pragma GCC diagnostic pop
 #endif
         }
       else /* back reference */
@@ -181,8 +183,9 @@ lzf_decompress (const void *const in_data,  unsigned int in_len,
 #endif
         }
     }
-  while (ip < in_end);
 
   return op - (u8 *)out_data;
 }
-
+#if defined(__GNUC__) && __GNUC__ >= 5
+#pragma GCC diagnostic pop
+#endif

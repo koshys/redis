@@ -61,6 +61,7 @@ set regression_vectors {
     {939895 151 59.149620271823181 65.204186651485145}
     {1412 156 149.29737817929004 15.95807862745508}
     {564862 149 84.062063109158544 -65.685403922426232}
+    {1546032440391 16751 -1.8175081637769495 20.665668878082954}
 }
 set rv_idx 0
 
@@ -72,6 +73,49 @@ start_server {tags {"geo"}} {
     test {GEOADD update} {
         r geoadd nyc -73.9454966 40.747533 "lic market"
     } {0}
+
+    test {GEOADD update with CH option} {
+        assert_equal 1 [r geoadd nyc CH 40.747533 -73.9454966 "lic market"]
+        lassign [lindex [r geopos nyc "lic market"] 0] x1 y1
+        assert {abs($x1) - 40.747 < 0.001}
+        assert {abs($y1) - 73.945 < 0.001}
+    } {}
+
+    test {GEOADD update with NX option} {
+        assert_equal 0 [r geoadd nyc NX -73.9454966 40.747533 "lic market"]
+        lassign [lindex [r geopos nyc "lic market"] 0] x1 y1
+        assert {abs($x1) - 40.747 < 0.001}
+        assert {abs($y1) - 73.945 < 0.001}
+    } {}
+
+    test {GEOADD update with XX option} {
+        assert_equal 0 [r geoadd nyc XX -83.9454966 40.747533 "lic market"]
+        lassign [lindex [r geopos nyc "lic market"] 0] x1 y1
+        assert {abs($x1) - 83.945 < 0.001}
+        assert {abs($y1) - 40.747 < 0.001}
+    } {}
+
+    test {GEOADD update with CH NX option} {
+        r geoadd nyc CH NX -73.9454966 40.747533 "lic market"
+    } {0}
+
+    test {GEOADD update with CH XX option} {
+        r geoadd nyc CH XX -73.9454966 40.747533 "lic market"
+    } {1}
+
+    test {GEOADD update with XX NX option will return syntax error} {
+        catch {
+            r geoadd nyc xx nx -73.9454966 40.747533 "lic market"
+        } err
+        set err
+    } {ERR*syntax*}
+
+    test {GEOADD update with invalid option} {
+        catch {
+            r geoadd nyc ch xx foo -73.9454966 40.747533 "lic market"
+        } err
+        set err
+    } {ERR*syntax*}
 
     test {GEOADD invalid coordinates} {
         catch {
@@ -93,13 +137,59 @@ start_server {tags {"geo"}} {
         r georadius nyc -73.9798091 40.7598464 3 km asc
     } {{central park n/q/r} 4545 {union square}}
 
+    test {GEOSEARCH simple (sorted)} {
+        r geosearch nyc fromlonlat -73.9798091 40.7598464 bybox 6 6 km asc
+    } {{central park n/q/r} 4545 {union square} {lic market}}
+
+    test {GEOSEARCH FROMLONLAT and FROMMEMBER cannot exist at the same time} {
+        catch {r geosearch nyc fromlonlat -73.9798091 40.7598464 frommember xxx bybox 6 6 km asc} e
+        set e
+    } {ERR*syntax*}
+
+    test {GEOSEARCH FROMLONLAT and FROMMEMBER one must exist} {
+        catch {r geosearch nyc bybox 3 3 km asc desc withhash withdist withcoord} e
+        set e
+    } {ERR*exactly one of FROMMEMBER or FROMLONLAT*}
+
+    test {GEOSEARCH BYRADIUS and BYBOX cannot exist at the same time} {
+        catch {r geosearch nyc fromlonlat -73.9798091 40.7598464 byradius 3 km bybox 3 3 km asc} e
+        set e
+    } {ERR*syntax*}
+
+    test {GEOSEARCH BYRADIUS and BYBOX one must exist} {
+        catch {r geosearch nyc fromlonlat -73.9798091 40.7598464 asc desc withhash withdist withcoord} e
+        set e
+    } {ERR*exactly one of BYRADIUS and BYBOX*}
+
+    test {GEOSEARCH with STOREDIST option} {
+        catch {r geosearch nyc fromlonlat -73.9798091 40.7598464 bybox 6 6 km asc storedist} e
+        set e
+    } {ERR*syntax*}
+
     test {GEORADIUS withdist (sorted)} {
         r georadius nyc -73.9798091 40.7598464 3 km withdist asc
     } {{{central park n/q/r} 0.7750} {4545 2.3651} {{union square} 2.7697}}
 
+    test {GEOSEARCH withdist (sorted)} {
+        r geosearch nyc fromlonlat -73.9798091 40.7598464 bybox 6 6 km withdist asc
+    } {{{central park n/q/r} 0.7750} {4545 2.3651} {{union square} 2.7697} {{lic market} 3.1991}}
+
     test {GEORADIUS with COUNT} {
         r georadius nyc -73.9798091 40.7598464 10 km COUNT 3
     } {{central park n/q/r} 4545 {union square}}
+
+    test {GEORADIUS with ANY not sorted by default} {
+        r georadius nyc -73.9798091 40.7598464 10 km COUNT 3 ANY
+    } {{wtc one} {union square} {central park n/q/r}}
+
+    test {GEORADIUS with ANY sorted by ASC} {
+        r georadius nyc -73.9798091 40.7598464 10 km COUNT 3 ANY ASC
+    } {{central park n/q/r} {union square} {wtc one}}
+
+    test {GEORADIUS with ANY but no COUNT} {
+        catch {r georadius nyc -73.9798091 40.7598464 10 km ANY ASC} e
+        set e
+    } {ERR*ANY*requires*COUNT*}
 
     test {GEORADIUS with COUNT but missing integer argument} {
         catch {r georadius nyc -73.9798091 40.7598464 10 km COUNT} e
@@ -118,6 +208,35 @@ start_server {tags {"geo"}} {
     test {GEORADIUSBYMEMBER simple (sorted)} {
         r georadiusbymember nyc "wtc one" 7 km
     } {{wtc one} {union square} {central park n/q/r} 4545 {lic market}}
+
+    test {GEOSEARCH FROMMEMBER simple (sorted)} {
+        r geosearch nyc frommember "wtc one" bybox 14 14 km
+    } {{wtc one} {union square} {central park n/q/r} 4545 {lic market} q4}
+
+    test {GEOSEARCH vs GEORADIUS} {
+        r del Sicily
+        r geoadd Sicily 13.361389 38.115556 "Palermo" 15.087269 37.502669 "Catania"
+        r geoadd Sicily 12.758489 38.788135 "edge1"   17.241510 38.788135 "eage2"
+        set ret1 [r georadius Sicily 15 37 200 km asc]
+        assert_equal $ret1 {Catania Palermo}
+        set ret2 [r geosearch Sicily fromlonlat 15 37 bybox 400 400 km asc]
+        assert_equal $ret2 {Catania Palermo eage2 edge1}
+    }
+
+    test {GEOSEARCH non square, long and narrow} {
+        r del Sicily
+        r geoadd Sicily 12.75 37.00 "test1"
+        r geoadd Sicily 12.75 36.50 "test2"
+        r geoadd Sicily 13.00 36.50 "test3"
+        # box height=2km width=400km
+        set ret1 [r geosearch Sicily fromlonlat 15 37 bybox 2 400 km]
+        assert_equal $ret1 {test1}
+
+        # Add a western Hemisphere point
+        r geoadd Sicily -1 37.00 "test3"
+        set ret2 [r geosearch Sicily fromlonlat 15 37 bybox 2 3000 km asc]
+        assert_equal $ret2 {test1 test3}
+    }
 
     test {GEORADIUSBYMEMBER withdist (sorted)} {
         r georadiusbymember nyc "wtc one" 7 km withdist
@@ -177,6 +296,11 @@ start_server {tags {"geo"}} {
         set e
     } {*ERR*syntax*}
 
+    test {GEOSEARCHSTORE STORE option: syntax error} {
+        catch {r geosearchstore abc points fromlonlat 13.361389 38.115556 byradius 50 km store abc} e
+        set e
+    } {*ERR*syntax*}
+
     test {GEORANGE STORE option: incompatible options} {
         r del points
         r geoadd points 13.361389 38.115556 "Palermo" \
@@ -197,11 +321,24 @@ start_server {tags {"geo"}} {
         assert_equal [r zrange points 0 -1] [r zrange points2 0 -1]
     }
 
+    test {GEOSEARCHSTORE STORE option: plain usage} {
+        r geosearchstore points2 points fromlonlat 13.361389 38.115556 byradius 500 km
+        assert_equal [r zrange points 0 -1] [r zrange points2 0 -1]
+    }
+
     test {GEORANGE STOREDIST option: plain usage} {
         r del points
         r geoadd points 13.361389 38.115556 "Palermo" \
                         15.087269 37.502669 "Catania"
         r georadius points 13.361389 38.115556 500 km storedist points2
+        set res [r zrange points2 0 -1 withscores]
+        assert {[lindex $res 1] < 1}
+        assert {[lindex $res 3] > 166}
+        assert {[lindex $res 3] < 167}
+    }
+
+    test {GEOSEARCHSTORE STOREDIST option: plain usage} {
+        r geosearchstore points2 points fromlonlat 13.361389 38.115556 byradius 500 km storedist
         set res [r zrange points2 0 -1 withscores]
         assert {[lindex $res 1] < 1}
         assert {[lindex $res 3] > 166}
@@ -274,8 +411,19 @@ start_server {tags {"geo"}} {
                 foreach place $diff {
                     set mydist [geo_distance $lon $lat $search_lon $search_lat]
                     set mydist [expr $mydist/1000]
-                    if {($mydist / $radius_km) > 0.999} {incr rounding_errors}
+                    if {($mydist / $radius_km) > 0.999} {
+                        incr rounding_errors
+                        continue
+                    }
+                    if {$mydist < $radius_m} {
+                        # This is a false positive for redis since given the 
+                        # same points the higher precision calculation provided 
+                        # by TCL shows the point within range
+                        incr rounding_errors
+                        continue
+                    }
                 }
+
                 # Make sure this is a real error and not a rounidng issue.
                 if {[llength $diff] == $rounding_errors} {
                     set res $res2; # Error silenced

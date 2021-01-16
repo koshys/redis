@@ -67,7 +67,7 @@ int hashTypeGetFromZiplist(robj *o, sds field,
     zl = o->ptr;
     fptr = ziplistIndex(zl, ZIPLIST_HEAD);
     if (fptr != NULL) {
-        fptr = ziplistFind(fptr, (unsigned char*)field, sdslen(field), 1);
+        fptr = ziplistFind(zl, fptr, (unsigned char*)field, sdslen(field), 1);
         if (fptr != NULL) {
             /* Grab pointer to the value (fptr points to the field) */
             vptr = ziplistNext(zl, fptr);
@@ -208,7 +208,7 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
         zl = o->ptr;
         fptr = ziplistIndex(zl, ZIPLIST_HEAD);
         if (fptr != NULL) {
-            fptr = ziplistFind(fptr, (unsigned char*)field, sdslen(field), 1);
+            fptr = ziplistFind(zl, fptr, (unsigned char*)field, sdslen(field), 1);
             if (fptr != NULL) {
                 /* Grab pointer to the value (fptr points to the field) */
                 vptr = ziplistNext(zl, fptr);
@@ -285,7 +285,7 @@ int hashTypeDelete(robj *o, sds field) {
         zl = o->ptr;
         fptr = ziplistIndex(zl, ZIPLIST_HEAD);
         if (fptr != NULL) {
-            fptr = ziplistFind(fptr, (unsigned char*)field, sdslen(field), 1);
+            fptr = ziplistFind(zl, fptr, (unsigned char*)field, sdslen(field), 1);
             if (fptr != NULL) {
                 zl = ziplistDelete(zl,&fptr); /* Delete the key. */
                 zl = ziplistDelete(zl,&fptr); /* Delete the value. */
@@ -450,14 +450,11 @@ sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) {
 
 robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
     robj *o = lookupKeyWrite(c->db,key);
+    if (checkType(c,o,OBJ_HASH)) return NULL;
+
     if (o == NULL) {
         o = createHashObject();
         dbAdd(c->db,key,o);
-    } else {
-        if (o->type != OBJ_HASH) {
-            addReply(c,shared.wrongtypeerr);
-            return NULL;
-        }
     }
     return o;
 }
@@ -507,6 +504,100 @@ void hashTypeConvert(robj *o, int enc) {
     }
 }
 
+/* This is a helper function for the COPY command.
+ * Duplicate a hash object, with the guarantee that the returned object
+ * has the same encoding as the original one.
+ *
+ * The resulting object always has refcount set to 1 */
+robj *hashTypeDup(robj *o) {
+    robj *hobj;
+    hashTypeIterator *hi;
+
+    serverAssert(o->type == OBJ_HASH);
+
+    if(o->encoding == OBJ_ENCODING_ZIPLIST){
+        unsigned char *zl = o->ptr;
+        size_t sz = ziplistBlobLen(zl);
+        unsigned char *new_zl = zmalloc(sz);
+        memcpy(new_zl, zl, sz);
+        hobj = createObject(OBJ_HASH, new_zl);
+        hobj->encoding = OBJ_ENCODING_ZIPLIST;
+    } else if(o->encoding == OBJ_ENCODING_HT){
+        dict *d = dictCreate(&hashDictType, NULL);
+        dictExpand(d, dictSize((const dict*)o->ptr));
+
+        hi = hashTypeInitIterator(o);
+        while (hashTypeNext(hi) != C_ERR) {
+            sds field, value;
+            sds newfield, newvalue;
+            /* Extract a field-value pair from an original hash object.*/
+            field = hashTypeCurrentFromHashTable(hi, OBJ_HASH_KEY);
+            value = hashTypeCurrentFromHashTable(hi, OBJ_HASH_VALUE);
+            newfield = sdsdup(field);
+            newvalue = sdsdup(value);
+
+            /* Add a field-value pair to a new hash object. */
+            dictAdd(d,newfield,newvalue);
+        }
+        hashTypeReleaseIterator(hi);
+
+        hobj = createObject(OBJ_HASH, d);
+        hobj->encoding = OBJ_ENCODING_HT;
+    } else {
+        serverPanic("Unknown hash encoding");
+    }
+    return hobj;
+}
+
+/* callback for to check the ziplist doesn't have duplicate recoreds */
+static int _hashZiplistEntryValidation(unsigned char *p, void *userdata) {
+    struct {
+        long count;
+        dict *fields;
+    } *data = userdata;
+
+    /* Odd records are field names, add to dict and check that's not a dup */
+    if (((data->count) & 1) == 0) {
+        unsigned char *str;
+        unsigned int slen;
+        long long vll;
+        if (!ziplistGet(p, &str, &slen, &vll))
+            return 0;
+        sds field = str? sdsnewlen(str, slen): sdsfromlonglong(vll);;
+        if (dictAdd(data->fields, field, NULL) != DICT_OK) {
+            /* Duplicate, return an error */
+            sdsfree(field);
+            return 0;
+        }
+    }
+
+    (data->count)++;
+    return 1;
+}
+
+/* Validate the integrity of the data stracture.
+ * when `deep` is 0, only the integrity of the header is validated.
+ * when `deep` is 1, we scan all the entries one by one. */
+int hashZiplistValidateIntegrity(unsigned char *zl, size_t size, int deep) {
+    if (!deep)
+        return ziplistValidateIntegrity(zl, size, 0, NULL, NULL);
+
+    /* Keep track of the field names to locate duplicate ones */
+    struct {
+        long count;
+        dict *fields;
+    } data = {0, dictCreate(&hashDictType, NULL)};
+
+    int ret = ziplistValidateIntegrity(zl, size, 1, _hashZiplistEntryValidation, &data);
+
+    /* make sure we have an even number of records. */
+    if (data.count & 1)
+        ret = 0;
+
+    dictRelease(data.fields);
+    return ret;
+}
+
 /*-----------------------------------------------------------------------------
  * Hash type commands
  *----------------------------------------------------------------------------*/
@@ -521,7 +612,7 @@ void hsetnxCommand(client *c) {
     } else {
         hashTypeSet(o,c->argv[2]->ptr,c->argv[3]->ptr,HASH_SET_COPY);
         addReply(c, shared.cone);
-        signalModifiedKey(c->db,c->argv[1]);
+        signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_HASH,"hset",c->argv[1],c->db->id);
         server.dirty++;
     }
@@ -532,7 +623,7 @@ void hsetCommand(client *c) {
     robj *o;
 
     if ((c->argc % 2) == 1) {
-        addReplyError(c,"wrong number of arguments for HMSET");
+        addReplyErrorFormat(c,"wrong number of arguments for '%s' command",c->cmd->name);
         return;
     }
 
@@ -551,9 +642,9 @@ void hsetCommand(client *c) {
         /* HMSET */
         addReply(c, shared.ok);
     }
-    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_HASH,"hset",c->argv[1],c->db->id);
-    server.dirty++;
+    server.dirty += (c->argc - 2)/2;
 }
 
 void hincrbyCommand(client *c) {
@@ -586,7 +677,7 @@ void hincrbyCommand(client *c) {
     new = sdsfromlonglong(value);
     hashTypeSet(o,c->argv[2]->ptr,new,HASH_SET_TAKE_VALUE);
     addReplyLongLong(c,value);
-    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_HASH,"hincrby",c->argv[1],c->db->id);
     server.dirty++;
 }
@@ -615,18 +706,22 @@ void hincrbyfloatCommand(client *c) {
     }
 
     value += incr;
+    if (isnan(value) || isinf(value)) {
+        addReplyError(c,"increment would produce NaN or Infinity");
+        return;
+    }
 
     char buf[MAX_LONG_DOUBLE_CHARS];
-    int len = ld2string(buf,sizeof(buf),value,1);
+    int len = ld2string(buf,sizeof(buf),value,LD_STR_HUMAN);
     new = sdsnewlen(buf,len);
     hashTypeSet(o,c->argv[2]->ptr,new,HASH_SET_TAKE_VALUE);
     addReplyBulkCBuffer(c,buf,len);
-    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_HASH,"hincrbyfloat",c->argv[1],c->db->id);
     server.dirty++;
 
     /* Always replicate HINCRBYFLOAT as an HSET command with the final value
-     * in order to make sure that differences in float pricision or formatting
+     * in order to make sure that differences in float precision or formatting
      * will not create differences in replicas or after an AOF restart. */
     robj *aux, *newobj;
     aux = createStringObject("HSET",4);
@@ -641,7 +736,7 @@ static void addHashFieldToReply(client *c, robj *o, sds field) {
     int ret;
 
     if (o == NULL) {
-        addReply(c, shared.nullbulk);
+        addReplyNull(c);
         return;
     }
 
@@ -652,7 +747,7 @@ static void addHashFieldToReply(client *c, robj *o, sds field) {
 
         ret = hashTypeGetFromZiplist(o, field, &vstr, &vlen, &vll);
         if (ret < 0) {
-            addReply(c, shared.nullbulk);
+            addReplyNull(c);
         } else {
             if (vstr) {
                 addReplyBulkCBuffer(c, vstr, vlen);
@@ -664,7 +759,7 @@ static void addHashFieldToReply(client *c, robj *o, sds field) {
     } else if (o->encoding == OBJ_ENCODING_HT) {
         sds value = hashTypeGetFromHashTable(o, field);
         if (value == NULL)
-            addReply(c, shared.nullbulk);
+            addReplyNull(c);
         else
             addReplyBulkCBuffer(c, value, sdslen(value));
     } else {
@@ -675,7 +770,7 @@ static void addHashFieldToReply(client *c, robj *o, sds field) {
 void hgetCommand(client *c) {
     robj *o;
 
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk)) == NULL ||
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == NULL ||
         checkType(c,o,OBJ_HASH)) return;
 
     addHashFieldToReply(c, o, c->argv[2]->ptr);
@@ -688,12 +783,9 @@ void hmgetCommand(client *c) {
     /* Don't abort when the key cannot be found. Non-existing keys are empty
      * hashes, where HMGET should respond with a series of null bulks. */
     o = lookupKeyRead(c->db, c->argv[1]);
-    if (o != NULL && o->type != OBJ_HASH) {
-        addReply(c, shared.wrongtypeerr);
-        return;
-    }
+    if (checkType(c,o,OBJ_HASH)) return;
 
-    addReplyMultiBulkLen(c, c->argc-2);
+    addReplyArrayLen(c, c->argc-2);
     for (i = 2; i < c->argc; i++) {
         addHashFieldToReply(c, o, c->argv[i]->ptr);
     }
@@ -717,7 +809,7 @@ void hdelCommand(client *c) {
         }
     }
     if (deleted) {
-        signalModifiedKey(c->db,c->argv[1]);
+        signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_HASH,"hdel",c->argv[1],c->db->id);
         if (keyremoved)
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],
@@ -766,17 +858,21 @@ static void addHashIteratorCursorToReply(client *c, hashTypeIterator *hi, int wh
 void genericHgetallCommand(client *c, int flags) {
     robj *o;
     hashTypeIterator *hi;
-    int multiplier = 0;
     int length, count = 0;
 
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptymultibulk)) == NULL
-        || checkType(c,o,OBJ_HASH)) return;
+    robj *emptyResp = (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) ?
+        shared.emptymap[c->resp] : shared.emptyarray;
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],emptyResp))
+        == NULL || checkType(c,o,OBJ_HASH)) return;
 
-    if (flags & OBJ_HASH_KEY) multiplier++;
-    if (flags & OBJ_HASH_VALUE) multiplier++;
-
-    length = hashTypeLength(o) * multiplier;
-    addReplyMultiBulkLen(c, length);
+    /* We return a map if the user requested keys and values, like in the
+     * HGETALL case. Otherwise to use a flat array makes more sense. */
+    length = hashTypeLength(o);
+    if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) {
+        addReplyMapLen(c, length);
+    } else {
+        addReplyArrayLen(c, length);
+    }
 
     hi = hashTypeInitIterator(o);
     while (hashTypeNext(hi) != C_ERR) {
@@ -791,6 +887,9 @@ void genericHgetallCommand(client *c, int flags) {
     }
 
     hashTypeReleaseIterator(hi);
+
+    /* Make sure we returned the right number of elements. */
+    if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) count /= 2;
     serverAssert(count == length);
 }
 
